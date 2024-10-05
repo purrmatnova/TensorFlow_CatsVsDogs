@@ -1,91 +1,123 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"github.com/nfnt/resize"
+	tensorflow "github.com/wamuir/graft/tensorflow"
 	"image"
 	"image/jpeg"
 	"log"
-	"os"
-
-	"github.com/nfnt/resize"
-	"github.com/wamuir/graft/tensorflow"
+	"net/http"
 )
 
-func main() {
-	// Укажем путь к модели и изображению
-	modelDir := "./modelKeras/"
-	imagePath := "cat.jpg"
-
-	// Загрузим модель TensorFlow
-	model, err := tensorflow.LoadSavedModel(modelDir, []string{"serve"}, nil)
-	if err != nil {
-		log.Fatalf("Ошибка загрузки модели: %v", err)
-	}
-	defer model.Session.Close()
-
-	// Загрузим изображение
-	imgFile, err := os.Open(imagePath)
-	if err != nil {
-		log.Fatalf("Не удалось открыть изображение: %v", err)
-	}
-	defer imgFile.Close()
-
-	// Декодируем изображения JPEG
-	img, err := jpeg.Decode(imgFile)
-	if err != nil {
-		log.Fatalf("Не удалось декодировать изображение: %v", err)
+// Предобработка изображения
+func preprocessImage(img image.Image) (*tensorflow.Tensor, error) {
+	resized := resize.Resize(180, 180, img, resize.Lanczos3)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, resized, nil); err != nil {
+		return nil, fmt.Errorf("failed to encode image: %v", err)
 	}
 
-	// Изменяем размер изображения до необходимого 256x256
-	imgResized := resize.Resize(256, 256, img, resize.NearestNeighbor)
-
-	// Конвертируем изображение в тензор формата []float32
-	tensor, err := imageToTensor(imgResized)
-	if err != nil {
-		log.Fatalf("Ошибка преобразования изображения в тензор: %v", err)
-	}
-
-	// Выполняем предсказание
-	output, err := model.Session.Run(
-		map[tensorflow.Output]*tensorflow.Tensor{
-			model.Graph.Operation("serving_default_input_1").Output(0): tensor,
-		},
-		[]tensorflow.Output{
-			model.Graph.Operation("StatefulPartitionedCall").Output(0),
-		},
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("Ошибка выполнения модели: %v", err)
-	}
-
-	// Обрабатываем предсказание
-	predictions := output[0].Value().([][]float32)
-	fmt.Println("Результат предсказания: ", predictions)
-
-	isCat := predictions[0][0] > 0.5
-	if isCat {
-		fmt.Println("На изображении кот.")
-	} else {
-		fmt.Println("На изображении не кот.")
-	}
-}
-
-// Преобразуем изображение в тензор
-func imageToTensor(img image.Image) (*tensorflow.Tensor, error) {
-	var data [1][256][256][3]float32
-
-	// Преобразуем изображение в массив float32
-	for y := 0; y < 256; y++ {
-		for x := 0; x < 256; x++ {
-			r, g, b, _ := img.At(x, y).RGBA()
-			// Нормализуем значения пикселей (0-65535) до (0-1)
-			data[0][y][x][0] = float32(r) / 65535.0
-			data[0][y][x][1] = float32(g) / 65535.0
-			data[0][y][x][2] = float32(b) / 65535.0
+	imageBytes := buf.Bytes()
+	var imageData [180][180][3]float32
+	index := 0
+	for i := range imageData {
+		for j := range imageData[i] {
+			for k := range imageData[i][j] {
+				if index < len(imageBytes) {
+					imageData[i][j][k] = float32(imageBytes[index]) / 255.0
+					index++
+				}
+			}
 		}
 	}
 
-	// Преобразуем массив в тензор
-	return tensorflow.NewTensor(data)
+	tensor, err := tensorflow.NewTensor([1][180][180][3]float32{imageData})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tensor: %v", err)
+	}
+
+	return tensor, nil
+}
+
+// Загрузка модели
+func loadModel(modelDir string) (*tensorflow.SavedModel, error) {
+	model, err := tensorflow.LoadSavedModel(modelDir, []string{"serve"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not load model: %v", err)
+	}
+	return model, nil
+}
+
+// Веб-эндпоинт предсказания
+func predict(w http.ResponseWriter, r *http.Request) {
+	file, _, err := r.FormFile("imagefile")
+	if err != nil {
+		http.Error(w, "could not read image", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		http.Error(w, "invalid image format", http.StatusBadRequest)
+		return
+	}
+
+	tensor, err := preprocessImage(img)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	model, err := loadModel("modelDir")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer model.Session.Close()
+
+	// Выбор операции на основе сигнатуры
+	sigChoice := r.URL.Query().Get("sig")
+	if sigChoice == "" {
+		sigChoice = "serving_default"
+	}
+
+	// Создание карты для input операций
+	inputs := map[tensorflow.Output]*tensorflow.Tensor{
+		model.Graph.Operation("serving_default_input_tensor").Output(0): tensor,
+	}
+
+	// Определяем output операции в зависимости от сигнатуры
+	outputOp := model.Graph.Operation("StatefulPartitionedCall").Output(0)
+	if outputOp == (tensorflow.Output{}) {
+		http.Error(w, "Invalid or missing output operation", http.StatusInternalServerError)
+		return
+	}
+
+	// Выполняем предсказание
+	results, err := model.Session.Run(
+		inputs,
+		[]tensorflow.Output{outputOp},
+		nil,
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("could not run the session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Обработка результата
+	probability := results[0].Value().([][]float32)[0][0]
+	prediction := "Скорее всего, это кот"
+	if probability > 0.5 {
+		prediction = "Кажется, это собака"
+	}
+
+	fmt.Fprintf(w, "Prediction: %s", prediction)
+}
+
+func main() {
+	http.HandleFunc("/predict", predict)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
