@@ -8,7 +8,6 @@ import (
 	"image/jpeg"
 	"io"
 	"log"
-	"net/http"
 	"os"
 
 	"github.com/nfnt/resize"
@@ -78,7 +77,7 @@ func predict(file io.Reader) (float32, error) {
 	defer model.Session.Close()
 
 	// Создание карты для input операций
-	op := model.Graph.Operation("serving_default_input_tensor")
+	op := model.Graph.Operation("serve_keras_tensor")
 	if op == nil {
 		return 0, errors.New("operation not found by name")
 	}
@@ -110,37 +109,7 @@ func predict(file io.Reader) (float32, error) {
 	return probability, nil
 }
 
-// Веб-эндпоинт предсказания
-func predictHandler(w http.ResponseWriter, r *http.Request) {
-	file, _, err := r.FormFile("imagefile")
-	if err != nil {
-		http.Error(w, "could not read image", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	probability, err := predict(file)
-	switch {
-	case errors.Is(err, ErrInvalidFormat):
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	case err != nil:
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Обработка результата
-	prediction := "Скорее всего, это кот"
-	if probability > 0.5 {
-		prediction = "Кажется, это собака"
-	}
-
-	fmt.Fprintf(w, "Prediction: %s", prediction)
-}
-
 func main() {
-	// http.HandleFunc("/predict", predictHandler)
-	// log.Fatal(http.ListenAndServe(":8080", nil))
 
 	file, err := os.Open("cat.jpg")
 	if err != nil {
