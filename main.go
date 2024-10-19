@@ -121,6 +121,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if probability <= 0.5 {
+		fmt.Printf("Скорее всего, на картинке изображен котик. Вероятность - %.2f%%\n", (1-probability)*100)
+	} else {
+		fmt.Printf("Скорее всего, на картинке изображена собака. Вероятность - %.2f%%\n", probability*100)
+	}
 
 	fmt.Println(probability)
 }
