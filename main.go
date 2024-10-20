@@ -22,10 +22,10 @@ func preprocessImage(img image.Image) (*tensorflow.Tensor, error) {
 	var imageData [dim][dim][3]float32
 	for i := range imageData {
 		for j := range imageData[i] {
-			r, g, b, _ := resized.At(i, j).RGBA()
-			imageData[i][j][0] = float32(r)
-			imageData[i][j][1] = float32(g)
-			imageData[i][j][2] = float32(b)
+			r, g, b, a := resized.At(i, j).RGBA()
+			imageData[i][j][0] = float32(r * a >> 24)
+			imageData[i][j][1] = float32(g * a >> 24)
+			imageData[i][j][2] = float32(b * a >> 24)
 		}
 	}
 
