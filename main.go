@@ -1,95 +1,142 @@
+// Example how to use Cats vs Dogs ML model trained using Tensorflow on Python.
 package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"image"
 	_ "image/jpeg"
 	"io"
-	"log"
 	"os"
 
 	"github.com/nfnt/resize"
-	tensorflow "github.com/wamuir/graft/tensorflow"
+	tf "github.com/wamuir/graft/tensorflow"
 )
 
-const dim = 180
+const (
+	imageDimension = 180
+	outputOpName   = "StatefulPartitionedCall"
+)
 
-// Предобработка изображения
-func preprocessImage(img image.Image) (*tensorflow.Tensor, error) {
-	resized := resize.Resize(dim, dim, img, resize.Lanczos3)
-
-	var imageData [dim][dim][3]float32
-	for i := range imageData {
-		for j := range imageData[i] {
-			r, g, b, a := resized.At(i, j).RGBA()
-			imageData[i][j][0] = float32(r * a >> 24)
-			imageData[i][j][1] = float32(g * a >> 24)
-			imageData[i][j][2] = float32(b * a >> 24)
-		}
-	}
-
-	tensor, err := tensorflow.NewTensor([1][dim][dim][3]float32{imageData})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tensor: %v", err)
-	}
-
-	return tensor, nil
-}
-
-// Загрузка модели
-func loadModel(modelDir string) (*tensorflow.SavedModel, error) {
-	model, err := tensorflow.LoadSavedModel(modelDir, []string{"serve"}, &tensorflow.SessionOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not load model: %v", err)
-	}
-	return model, nil
-}
+var serveTag = []string{"serve"} // Const.
 
 var (
-	ErrInvalidFormat = errors.New("invalid image format")
-	ErrInvalidOp     = errors.New("invalid or missing output operation")
-	ErrRunSession    = errors.New("could not run the session")
+	ErrBadImageDimensions = errors.New("bad image dimensions")
+	ErrCreateTensor       = errors.New("create tensor")
+	ErrInvalidFormat      = errors.New("invalid image format")
+	ErrInvalidOp          = errors.New("invalid or missing output operation")
+	ErrLoadModel          = errors.New("could not load model")
+	ErrRunSession         = errors.New("could not run the session")
+	ErrWrongOperationName = errors.New("wrong operation name")
 )
 
-func predict(file io.Reader) (float32, error) {
-	img, _, err := image.Decode(file)
+//nolint:gochecknoglobals // By design.
+var (
+	flagModelDir  string
+	flagInputName string
+)
+
+func init() { //nolint:gochecknoinits // By design.
+	flag.Usage = func() { //nolint:reassign // By design.
+		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [flags] file.jpg ...\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+
+	flag.StringVar(&flagModelDir, "model", "model", "directory with model")
+	flag.StringVar(&flagInputName, "inputname", "serve_keras_tensor", "input operation name")
+}
+
+func main() {
+	flag.Parse()
+
+	if len(flag.Args()) == 0 {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	err := run(flagModelDir, flagInputName, flag.Args())
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+}
+
+func run(modelDir string, inputOpName string, paths []string) (err error) {
+	model, err := loadModel(modelDir)
+	if err != nil {
+		return err
+	}
+	defer joinErr(&err, model.Session.Close)
+
+	const catMaxProbability = 0.5
+	const percent = 100
+	for _, path := range paths {
+		animal := "dog"
+		probability, errPath := analyze(model, inputOpName, path)
+		switch {
+		case errPath != nil:
+			err = errors.Join(err, errPath)
+			continue
+		case probability <= catMaxProbability:
+			animal = "cat"
+			probability = (1 - probability)
+		}
+		fmt.Printf("%s %5.2f%% %s\n", animal, probability*percent, path)
+	}
+	return err
+}
+
+func analyze(model *tf.SavedModel, inputOpName string, path string) (float32, error) {
+	file, err := os.Open(path) //nolint:gosec // Safe in CLI.
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close() //nolint:errcheck // False positive.
+
+	probability, err := predict(model, inputOpName, file)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", path, err)
+	}
+	return probability, nil
+}
+
+func predict(model *tf.SavedModel, inputOpName string, imageReader io.Reader) (float32, error) {
+	img, _, err := image.Decode(imageReader)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", ErrInvalidFormat, err)
 	}
-	tensor, err := preprocessImage(img)
+
+	img = preprocessImage(img, imageDimension)
+
+	inputTensor, err := tensorFromImage(img)
 	if err != nil {
 		return 0, err
 	}
-	model, err := loadModel("modelDir")
-	if err != nil {
-		return 0, err
-	}
-	defer model.Session.Close()
 
 	// Создание карты для input операций
-	op := model.Graph.Operation("serve_keras_tensor")
+	op := model.Graph.Operation(inputOpName)
 	if op == nil {
-		return 0, errors.New("operation not found by name")
+		return 0, fmt.Errorf("%w: input %s", ErrWrongOperationName, inputOpName)
 	}
-	inputs := map[tensorflow.Output]*tensorflow.Tensor{
-		model.Graph.Operation("serve_keras_tensor").Output(0): tensor,
+	inputs := map[tf.Output]*tf.Tensor{
+		model.Graph.Operation(inputOpName).Output(0): inputTensor,
 	}
 
 	// Определяем output операции в зависимости от сигнатуры
-	op2 := model.Graph.Operation("StatefulPartitionedCall")
+	op2 := model.Graph.Operation(outputOpName)
 	if op2 == nil {
-		return 0, errors.New("output operation not found by name")
+		return 0, fmt.Errorf("%w: output %s", ErrWrongOperationName, outputOpName)
 	}
 	outputOp := model.Graph.Operation("StatefulPartitionedCall").Output(0)
-	if outputOp == (tensorflow.Output{}) {
+	if outputOp == (tf.Output{}) {
 		return 0, ErrInvalidOp
 	}
 
 	// Выполняем предсказание
 	results, err := model.Session.Run(
 		inputs,
-		[]tensorflow.Output{outputOp},
+		[]tf.Output{outputOp},
 		nil,
 	)
 	if err != nil {
@@ -100,22 +147,42 @@ func predict(file io.Reader) (float32, error) {
 	return probability, nil
 }
 
-func main() {
-	file, err := os.Open("cat.jpg")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
+func preprocessImage(img image.Image, dim uint) image.Image {
+	return resize.Resize(dim, dim, img, resize.Lanczos3)
+}
 
-	probability, err := predict(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if probability <= 0.5 {
-		fmt.Printf("Скорее всего, на картинке изображен котик. Вероятность - %.2f%%\n", (1-probability)*100)
-	} else {
-		fmt.Printf("Скорее всего, на картинке изображена собака. Вероятность - %.2f%%\n", probability*100)
+func tensorFromImage(img image.Image) (*tf.Tensor, error) {
+	if img.Bounds().Dx() != imageDimension || img.Bounds().Dy() != imageDimension {
+		return nil, fmt.Errorf("%w: %v", ErrBadImageDimensions, img.Bounds())
 	}
 
-	fmt.Println(probability)
+	var imageData [imageDimension][imageDimension][3]float32
+	for i := range imageData {
+		for j := range imageData[i] {
+			const bitsToByte = 24
+			r, g, b, a := img.At(i, j).RGBA()
+			imageData[i][j][0] = float32(r * a >> bitsToByte)
+			imageData[i][j][1] = float32(g * a >> bitsToByte)
+			imageData[i][j][2] = float32(b * a >> bitsToByte)
+		}
+	}
+
+	tensor, err := tf.NewTensor([1][imageDimension][imageDimension][3]float32{imageData})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCreateTensor, err)
+	}
+
+	return tensor, nil
+}
+
+func loadModel(modelDir string) (*tf.SavedModel, error) {
+	model, err := tf.LoadSavedModel(modelDir, serveTag, &tf.SessionOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrLoadModel, err)
+	}
+	return model, nil
+}
+
+func joinErr(err *error, f func() error) { //nolint:gocritic // By design.
+	*err = errors.Join(*err, f())
 }
