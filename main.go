@@ -82,7 +82,7 @@ func predict(file io.Reader) (float32, error) {
 		return 0, errors.New("operation not found by name")
 	}
 	inputs := map[tensorflow.Output]*tensorflow.Tensor{
-		model.Graph.Operation("serving_default_input_tensor").Output(0): tensor,
+		model.Graph.Operation("serve_keras_tensor").Output(0): tensor,
 	}
 
 	// Определяем output операции в зависимости от сигнатуры
@@ -110,7 +110,6 @@ func predict(file io.Reader) (float32, error) {
 }
 
 func main() {
-
 	file, err := os.Open("cat.jpg")
 	if err != nil {
 		log.Fatal(err)
