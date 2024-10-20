@@ -1,11 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"image"
-	"image/jpeg"
+	_ "image/jpeg"
 	"io"
 	"log"
 	"os"
@@ -19,22 +18,14 @@ const dim = 180
 // Предобработка изображения
 func preprocessImage(img image.Image) (*tensorflow.Tensor, error) {
 	resized := resize.Resize(dim, dim, img, resize.Lanczos3)
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, resized, nil); err != nil {
-		return nil, fmt.Errorf("failed to encode image: %v", err)
-	}
 
-	imageBytes := buf.Bytes()
 	var imageData [dim][dim][3]float32
-	index := 0
 	for i := range imageData {
 		for j := range imageData[i] {
-			for k := range imageData[i][j] {
-				if index < len(imageBytes) {
-					imageData[i][j][k] = float32(imageBytes[index]) / 255.0
-					index++
-				}
-			}
+			r, g, b, _ := resized.At(i, j).RGBA()
+			imageData[i][j][0] = float32(r)
+			imageData[i][j][1] = float32(g)
+			imageData[i][j][2] = float32(b)
 		}
 	}
 
